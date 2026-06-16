@@ -30,16 +30,13 @@ def review(diff: str) -> str:
         return ""
 
     try:
-        import google.generativeai as genai
+        from google import genai
     except ImportError:
-        print("[Gemini] google-generativeai 未インストールのためスキップします。", file=sys.stderr)
+        print("[Gemini] google-genai 未インストールのためスキップします。", file=sys.stderr)
         return ""
 
     if len(diff) > 100_000:
         diff = diff[:100_000] + "\n... (差分が大きいため省略)"
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
 
     prompt = f"""以下のコード差分をレビューしてください。
 
@@ -56,8 +53,13 @@ def review(diff: str) -> str:
 {diff}
 """
 
-    response = model.generate_content(prompt)
-    return response.text
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        return response.text
+    except Exception as e:
+        print(f"[Gemini] APIエラーのためスキップします: {e}", file=sys.stderr)
+        return ""
 
 
 if __name__ == "__main__":
