@@ -96,17 +96,47 @@ on:
   push:
     branches: [main]
   pull_request:
+permissions:
+  contents: read
+  security-events: write   # SARIF を Security タブへ上げるのに必要
 jobs:
   semgrep:
     runs-on: ubuntu-latest
-    container:
-      image: semgrep/semgrep
     steps:
       - uses: actions/checkout@v4
-      - run: semgrep scan --config=auto --error
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install semgrep
+      - name: Semgrep scan
+        run: semgrep scan --config=auto --sarif --output=semgrep.sarif --error
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
 ```
 
 `--config=auto` は言語を自動判別して公開ルールセットを適用する。Community 版のルールセットのみで pro ルールは含まれない。
+
+**ブロック方針と SARIF:**
+
+- `--error` で**検出があれば job を落とし push/PR をブロック**する（「気づければいい」ではなく「止める」方針）。
+- 結果は SARIF で出力し、`if: always()` で**ブロック時も必ず後段に渡す**。
+- **Security タブへの掲載は public リポジトリ（または GitHub Advanced Security 契約済み）でのみ可能。** private で未契約だと upload は失敗するが、`continue-on-error: true` のため job は落とさない（ブロックは scan 側が担保）。
+- private でも確認できるよう **SARIF を成果物（artifact）としても保存**する。Actions の実行結果からダウンロードできる。
+- コンテナ（`semgrep/semgrep` image）はやめて `pip install semgrep` に変更。理由は、`upload-sarif` アクション（Node 製）がコンテナ内だと Node 不在で動かないことがあるため。
+
+**誤検知の抑制（`.semgrepignore`）:**
+
+スキャン対象から外したいパスは `.semgrepignore` に記述する（setup.sh が雛形を生成）。個別の検出だけ黙らせたい場合は、該当行の直前に `# nosemgrep` コメントを置く。「止まるが、正規の手順で黙らせられる」状態を保ち、`--error` の場当たり的な無効化を防ぐ。
 
 #### Dependabot（依存関係スキャン）
 
@@ -166,7 +196,7 @@ export GEMINI_API_KEY="your_api_key"
 # 3. 作成されたファイルをコミット
 git add .pre-commit-config.yaml .secrets.baseline \
         scripts/gemini_review.py \
-        .github/workflows/semgrep.yml
+        .github/workflows/semgrep.yml .semgrepignore
 # Dependabot を設定した場合は追加
 git add .github/dependabot.yml
 git commit -m "add pj-vauban security setup"
@@ -201,9 +231,9 @@ Zaion check（人間の最終確認・最後の砦）→ マージ
 | ツール | 無料範囲 |
 | :--- | :--- |
 | Claude Code | Claude Pro に含まれる |
-| Gemini 2.0 Flash | AI Studio の無料枠（レートリミットあり） |
+| Gemini（既定 2.5 Flash） | AI Studio の無料枠（レートリミット・モデル別quotaあり。`GEMINI_MODEL` で差替可） |
 | detect-secrets | 完全無料（OSS） |
-| Semgrep Community | 完全無料（プライベートリポジトリ含む）|
+| Semgrep Community | 完全無料（プライベートリポジトリ含む）。ただし SARIF の Security タブ掲載は public / GHAS のみ |
 | Dependabot | GitHub 標準機能（無料） |
 | Qodo Merge | 個人プラン無料（制限あり・要確認） |
 

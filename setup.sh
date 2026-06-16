@@ -61,16 +61,60 @@ on:
   push:
     branches: [main]
   pull_request:
+permissions:
+  contents: read
+  security-events: write   # SARIF を Security タブへ上げるのに必要
 jobs:
   semgrep:
     runs-on: ubuntu-latest
-    container:
-      image: semgrep/semgrep
     steps:
       - uses: actions/checkout@v4
-      - run: semgrep scan --config=auto --error
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install semgrep
+      # 検出があれば --error で job を落とし push/PR をブロックする
+      - name: Semgrep scan
+        run: semgrep scan --config=auto --sarif --output=semgrep.sarif --error
+      # ブロックされても結果は必ず残す。
+      # Security タブへの上げは public/GHAS のみ可。private で未契約だと失敗するが
+      # continue-on-error で job は落とさない（ブロックは scan 側が担う）。
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+      # private repo でも確認できるよう SARIF を成果物としても残す
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
 EOF
 echo "✓ .github/workflows/semgrep.yml"
+
+# 3b. .semgrepignore（誤検知の抑制ポイント）
+if [ ! -f "$TARGET/.semgrepignore" ]; then
+  cat > "$TARGET/.semgrepignore" << 'EOF'
+# Semgrep のスキャン対象から除外するパス
+# https://semgrep.dev/docs/ignoring-files-folders-code
+#
+# 個別の検出を黙らせたい場合は、該当行の直前に  # nosemgrep  コメントを置く。
+node_modules/
+.venv/
+venv/
+vendor/
+dist/
+build/
+__pycache__/
+*.min.js
+EOF
+  echo "✓ .semgrepignore（新規生成）"
+else
+  echo "✓ .semgrepignore（既存を維持）"
+fi
 
 # 4. .github/dependabot.yml（ecosystem 指定時のみ）
 if [ "$ECOSYSTEM" != "none" ]; then
