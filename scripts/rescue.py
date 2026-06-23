@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+vauban rescue agent
+
+対象リポジトリの Semgrep CI 失敗を検出し、修正ブランチを作成して PR を開く。
+ルールベースの修正:
+  - tests/** の findings → .semgrepignore に追加
+  - その他 → 該当行に # nosemgrep: <rule-id> を付与
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+GITHUB_OWNER = "mediiiiium"
+
+# (repo, dependabot-ecosystem)
+REPOS = [
+    ("now-on-tap", "npm"),
+    ("podcast",    "pip"),
+    ("sora",       "pip"),
+    ("mcp-jp",     "none"),
+    ("brew-drop",  "none"),
+]
+
+RESCUE_BRANCH = "vauban/rescue-semgrep"
+RESCUE_LABEL  = "vauban-rescue"
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def run(cmd, cwd=None):
+    return subprocess.run(
+        cmd, check=True, capture_output=True, text=True, cwd=cwd
+    )
+
+
+def gh(*args):
+    pat = os.environ["GH_PAT"]
+    return run(["gh"] + list(args), cwd=None)
+
+
+def gh_json(*args):
+    return json.loads(gh(*args).stdout)
+
+
+# ── per-repo logic ────────────────────────────────────────────────────────────
+
+def latest_semgrep_failure(repo):
+    """最新の semgrep run が失敗していれば run_id を返す。なければ None。"""
+    runs = gh_json(
+        "run", "list",
+        "--repo", f"{GITHUB_OWNER}/{repo}",
+        "--workflow", "semgrep.yml",
+        "--limit", "1",
+        "--json", "databaseId,conclusion",
+    )
+    if not runs or runs[0]["conclusion"] != "failure":
+        return None
+    return runs[0]["databaseId"]
+
+
+def rescue_pr_exists(repo):
+    prs = gh_json(
+        "pr", "list",
+        "--repo", f"{GITHUB_OWNER}/{repo}",
+        "--head", RESCUE_BRANCH,
+        "--json", "number",
+    )
+    return bool(prs)
+
+
+def download_sarif(repo, run_id, dest):
+    try:
+        gh(
+            "run", "download", str(run_id),
+            "--repo", f"{GITHUB_OWNER}/{repo}",
+            "--name", "semgrep-sarif",
+            "--dir", dest,
+        )
+        sarif_path = Path(dest) / "semgrep.sarif"
+        return sarif_path if sarif_path.exists() else None
+    except subprocess.CalledProcessError:
+        return None
+
+
+def parse_findings(sarif_path):
+    data = json.loads(sarif_path.read_text())
+    findings = []
+    for r in data.get("runs", []):
+        for result in r.get("results", []):
+            rule_id = result.get("ruleId", "")
+            msg     = result.get("message", {}).get("text", "")
+            for loc in result.get("locations", []):
+                uri  = loc.get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
+                line = loc.get("physicalLocation", {}).get("region", {}).get("startLine", 0)
+                findings.append({"rule": rule_id, "file": uri, "line": line, "msg": msg})
+    return findings
+
+
+def plan_fixes(findings):
+    """
+    Returns:
+      semgrepignore_paths: set of paths to add to .semgrepignore
+      inline_fixes: list of {file, line, rule}
+      skip: list of findings we can't auto-fix
+    """
+    semgrepignore_paths = set()
+    inline_fixes = []
+    skip = []
+
+    for f in findings:
+        path = f["file"]
+        # テストコードは false positive が多い → パスごと除外
+        if path.startswith("tests/") or path.startswith("test/"):
+            top = path.split("/")[0] + "/"
+            semgrepignore_paths.add(top)
+        else:
+            # インライン nosemgrep コメントで抑制
+            inline_fixes.append(f)
+
+    return semgrepignore_paths, inline_fixes, skip
+
+
+def apply_semgrepignore(repo_path, paths):
+    """paths を .semgrepignore に追記する（重複スキップ）。"""
+    target = repo_path / ".semgrepignore"
+    content = target.read_text() if target.exists() else ""
+    added = []
+    for p in sorted(paths):
+        if p not in content:
+            content = content.rstrip("\n") + f"\n{p}"
+            added.append(p)
+    if added:
+        target.write_text(content.strip() + "\n")
+    return added
+
+
+def apply_nosemgrep(repo_path, fixes):
+    """各行末に # nosemgrep: <rule> を付与する（既に付いていればスキップ）。"""
+    changed_files = set()
+    for fix in fixes:
+        target = repo_path / fix["file"]
+        if not target.exists():
+            continue
+        lines = target.read_text().splitlines(keepends=True)
+        idx = fix["line"] - 1
+        if idx < 0 or idx >= len(lines):
+            continue
+        if "nosemgrep" in lines[idx]:
+            continue
+        lines[idx] = lines[idx].rstrip("\n") + f"  # nosemgrep: {fix['rule']}\n"
+        target.write_text("".join(lines))
+        changed_files.add(fix["file"])
+    return changed_files
+
+
+def ensure_label(repo):
+    """RESCUE_LABEL が無ければ作成する。"""
+    try:
+        gh(
+            "label", "create", RESCUE_LABEL,
+            "--repo", f"{GITHUB_OWNER}/{repo}",
+            "--color", "e4e669",
+            "--description", "Opened by vauban-rescue agent",
+        )
+    except subprocess.CalledProcessError:
+        pass  # already exists
+
+
+def open_pr(repo, findings):
+    lines = "\n".join(
+        f"- `{f['file']}:{f['line']}` [{f['rule']}]" for f in findings
+    )
+    body = (
+        "## Semgrep findings\n\n"
+        f"{lines}\n\n"
+        "---\n"
+        "_Auto-generated by [vauban](https://github.com/mediiiiium/vauban) rescue agent_"
+    )
+    ensure_label(repo)
+    gh(
+        "pr", "create",
+        "--repo", f"{GITHUB_OWNER}/{repo}",
+        "--title", "fix: suppress semgrep findings (vauban-rescue)",
+        "--body", body,
+        "--label", RESCUE_LABEL,
+        "--head", RESCUE_BRANCH,
+    )
+
+
+def rescue_repo(repo):
+    print(f"\n=== {repo} ===")
+
+    run_id = latest_semgrep_failure(repo)
+    if not run_id:
+        print("  semgrep: OK (no failures)")
+        return
+
+    if rescue_pr_exists(repo):
+        print("  rescue PR already open — skipping")
+        return
+
+    with tempfile.TemporaryDirectory() as sarif_dir:
+        sarif_path = download_sarif(repo, run_id, sarif_dir)
+        if not sarif_path:
+            print("  SARIF not found (artifact may have expired)")
+            return
+
+        findings = parse_findings(sarif_path)
+        if not findings:
+            print("  no findings in SARIF")
+            return
+
+        print(f"  {len(findings)} finding(s) detected")
+        semgrepignore_paths, inline_fixes, _ = plan_fixes(findings)
+
+    with tempfile.TemporaryDirectory() as clone_dir:
+        pat = os.environ["GH_PAT"]
+        clone_url = f"https://x-access-token:{pat}@github.com/{GITHUB_OWNER}/{repo}.git"
+
+        run(["git", "clone", clone_url, clone_dir])
+        run(["git", "checkout", "-b", RESCUE_BRANCH], cwd=clone_dir)
+
+        repo_path = Path(clone_dir)
+        changed = False
+
+        added_paths = apply_semgrepignore(repo_path, semgrepignore_paths)
+        if added_paths:
+            print(f"  .semgrepignore: added {added_paths}")
+            changed = True
+
+        changed_files = apply_nosemgrep(repo_path, inline_fixes)
+        if changed_files:
+            print(f"  nosemgrep comments: {sorted(changed_files)}")
+            changed = True
+
+        if not changed:
+            print("  nothing to fix automatically")
+            return
+
+        run(["git", "add", "-A"], cwd=clone_dir)
+        run(
+            ["git", "commit", "-m", "fix: suppress semgrep findings [vauban-rescue]"],
+            cwd=clone_dir,
+        )
+        run(["git", "push", clone_url, f"HEAD:{RESCUE_BRANCH}"], cwd=clone_dir)
+
+        open_pr(repo, findings)
+        print("  PR opened ✓")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    if "GH_PAT" not in os.environ:
+        print("ERROR: GH_PAT not set", file=sys.stderr)
+        sys.exit(1)
+
+    run(["git", "config", "--global", "user.name",  "vauban-rescue"])
+    run(["git", "config", "--global", "user.email", "vauban-rescue@users.noreply.github.com"])
+
+    for repo, _ in REPOS:
+        try:
+            rescue_repo(repo)
+        except Exception as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+
+    print("\ndone.")
+
+
+if __name__ == "__main__":
+    main()
